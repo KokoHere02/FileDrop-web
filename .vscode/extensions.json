@@ -1,0 +1,7 @@
+{
+  "recommendations": ["Vue.volar"],
+  "vue.compilerOptions": {
+    "experimentalDisableTemplateSupport": false,
+    "experimentalErasableSyntaxOnly": false
+  }
+}
