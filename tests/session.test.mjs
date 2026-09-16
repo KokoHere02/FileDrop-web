@@ -1,29 +1,28 @@
-import { test, after } from 'node:test'
+﻿import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { build } from 'esbuild'
 import { createRenderer } from 'vue'
 import { createPinia } from 'pinia'
 import axios from 'axios'
 
-// 编译真实 composable；只替换浏览器网络和 RTC API，不复制协商实现。
-axios.defaults.adapter = async config => ({ data: { code: 200, data: 'Ab3xY9' }, status: 200, statusText: 'OK', headers: {}, config })
-await build({ stdin: { contents: "export { useSession } from './src/composables/useSession'; export { useRoomStore } from './src/store/RoomStore'", resolveDir: process.cwd() }, bundle: true, platform: 'node', format: 'esm', packages: 'external', define: { 'import.meta.env': '{}' }, outfile: 'node_modules/.tmp/session-test.mjs' })
-const { useSession, useRoomStore } = await import('../node_modules/.tmp/session-test.mjs')
+const token = 'x'.repeat(43)
+let requests = 0
+axios.defaults.adapter = async config => { requests++; return { data: { code: 200, data: { code: 'Ab3xY9', senderToken: token } }, status: 200, statusText: 'OK', headers: {}, config } }
+await build({ stdin: { contents: "export { useSession } from './src/composables/useSession'; export { useRoomStore } from './src/store/RoomStore'; export { useFileDistribution } from './src/composables/useFileDistribution'", resolveDir: process.cwd() }, bundle: true, platform: 'node', format: 'esm', packages: 'external', define: { 'import.meta.env': '{}' }, outfile: 'node_modules/.tmp/session-test.mjs' })
+const { useSession, useRoomStore, useFileDistribution } = await import('../node_modules/.tmp/session-test.mjs')
 const saved = { WebSocket: globalThis.WebSocket, RTCPeerConnection: globalThis.RTCPeerConnection, window: globalThis.window }
 after(() => Object.assign(globalThis, saved))
-
 class Channel extends EventTarget {
   readyState = 'connecting'
-  close() { this.readyState = 'closed' }
+  close() { this.readyState = 'closed'; this.dispatchEvent(new Event('close')) }
+  open() { this.readyState = 'open'; this.onopen?.() }
 }
 class Peer {
-  static instances = []
   signalingState = 'stable'
   connectionState = 'new'
   remoteDescription = null
   channels = []
   candidates = []
-  constructor() { Peer.instances.push(this) }
   createDataChannel(label, options) { assert.equal(options.ordered, true); const channel = new Channel(); this.channels.push(channel); return channel }
   async createOffer() { return { type: 'offer', sdp: 'test-offer' } }
   async createAnswer() { return { type: 'answer', sdp: 'test-answer' } }
@@ -40,97 +39,210 @@ class Socket {
   constructor(url) { this.url = url; Socket.instances.push(this) }
   open() { this.readyState = 1; this.onopen?.() }
   send(data) { this.sent.push(JSON.parse(data)) }
-  receive(type, payload) { this.onmessage?.({ data: JSON.stringify({ type, payload }) }) }
+  receive(type, payload, from, to = 'self') { this.onmessage?.({ data: JSON.stringify({ type, payload, from, to }) }) }
   close() { this.readyState = 3 }
 }
 globalThis.WebSocket = Socket
 globalThis.RTCPeerConnection = Peer
 globalThis.window = { location: { href: 'http://localhost:5173/' } }
 const renderer = createRenderer({ createComment: () => ({}), insert() {}, remove() {}, parentNode() {}, nextSibling() {} })
-const flush = async () => { for (let i = 0; i < 20; i++) await Promise.resolve() }
-async function mount(t, role = 'receiver', type = 'file') {
+const flush = async () => { for (let i = 0; i < 30; i++) await Promise.resolve() }
+async function mount(t, role = 'receiver', type = 'file', options = {}) {
   let session
-  const app = renderer.createApp({ setup() { useRoomStore().setRole(role); session = useSession(type); return () => null } })
-  app.use(createPinia())
-  app.mount({})
+  const app = renderer.createApp({ setup() { useRoomStore().setRole(role); session = useSession(type, options); return () => null } })
+  app.use(createPinia()); app.mount({})
   t.after(() => app.unmount())
   await session.connect('Ab3xY9')
   const ws = Socket.instances.at(-1)
   ws.open()
-  return { session, ws }
+  return { session, ws, accept: () => ws.receive('accepted', { protocolVersion: 3, code: 'Ab3xY9', role, clientId: 'self' }), ready: (id = 'other') => ws.receive('peer-ready', { peerId: id, peerRole: role === 'sender' ? 'receiver' : 'sender', initiator: role === 'sender' }, id) }
 }
 
-for (const role of ['sender', 'receiver']) {
-  test(`${role} first: joined creates one ordered channel and offer`, async t => {
-    const { session, ws } = await mount(t, role)
-    assert.equal(session.connected.value, false)
-    ws.receive('joined', 'joined')
-    await flush()
-    assert.equal(session.peer.value.channels.length, 1)
-    assert.equal(ws.sent.filter(msg => msg.type === 'offer').length, 1)
-    assert.equal(session.status.value, '正在协商连接')
-  })
-  test(`${role} second: offer produces answer without duplicate channel`, async t => {
-    const { session, ws } = await mount(t, role)
-    ws.receive('offer', { type: 'offer', sdp: 'remote' })
-    await flush()
-    assert.equal(session.peer.value.channels.length, 0)
-    assert.equal(ws.sent.at(-1).type, 'answer')
-  })
-}
-test('ICE before SDP queues and flushes after remote description', async t => {
-  const { session, ws } = await mount(t)
-  ws.receive('candidate', { candidate: 'early' })
-  ws.receive('offer', { type: 'offer', sdp: 'remote' })
-  await flush()
-  assert.equal(session.peer.value.candidates[0].candidate, 'early')
-})
-test('reset invalidates in-flight offer and queued ICE; rejoin creates new peer', async t => {
-  const { session, ws } = await mount(t)
-  const oldPeer = session.ensurePeer()
-  let release
-  oldPeer.createOffer = () => new Promise(resolve => { release = resolve })
-  ws.receive('joined', 'joined')
-  await flush()
-  ws.receive('candidate', { candidate: 'stale' })
-  ws.receive('reset', 'reset')
-  ws.receive('joined', 'joined')
-  await flush()
-  release({ type: 'offer', sdp: 'stale' })
-  await flush()
-  assert.notEqual(session.peer.value, oldPeer)
-  assert.equal(oldPeer.connectionState, 'closed')
-  assert.equal(ws.sent.filter(msg => msg.type === 'offer').length, 1)
-  ws.receive('answer', { type: 'answer', sdp: 'new-answer' })
-  await flush()
-  assert.deepEqual(session.peer.value.candidates, [])
-  assert.equal(session.isWs.value, true)
-})
-test('error preserves close handler and 1008 produces accurate message', async t => {
-  const { session, ws } = await mount(t)
-  ws.onerror()
-  ws.onclose({ code: 1008, reason: '' })
-  assert.match(session.error.value, /房间不可用或角色已被占用/)
+test('sender uses token, onopen does not imply accepted, credentials are not exposed', async t => {
+  const { session, ws, accept } = await mount(t, 'sender')
+  assert.equal(ws.url.searchParams.get('senderToken'), token)
+  assert.equal(session.accepted.value, false)
   assert.equal(session.roomId.value, '')
+  assert.equal(session.busy.value, true)
+  accept()
+  assert.equal(session.roomId.value, 'Ab3xY9')
+  assert.equal(session.clientId.value, 'self')
+  assert.equal(session.senderToken, undefined)
 })
-test('invalid code never opens a WebSocket; code case is preserved', async t => {
+test('receiver never includes sender credential', async t => {
+  const { ws } = await mount(t)
+  assert.equal(ws.url.searchParams.has('senderToken'), false)
+})
+test('old protocol accepted is rejected explicitly', async t => {
   const { session, ws } = await mount(t)
+  ws.receive('accepted', { protocolVersion: 2, code: 'Ab3xY9', role: 'receiver', clientId: 'self' })
+  assert.match(session.error.value, /v3/)
+  assert.equal(session.accepted.value, false)
+})
+test('sender offers independently to two receivers; repeated peer-ready is idempotent', async t => {
+  const { session, ws, accept, ready } = await mount(t, 'sender')
+  accept(); ready('A'); ready('B'); ready('A')
+  await flush()
+  assert.equal(session.peers.size, 2)
+  assert.deepEqual(ws.sent.filter(msg => msg.type === 'offer').map(msg => msg.to), ['A', 'B'])
+  for (const peer of session.peers.values()) assert.equal(peer.pc.channels.length, 1)
+  session.peers.get('A').pc.onicecandidate({ candidate: { candidate: 'ice-A' } })
+  assert.equal(ws.sent.at(-1).to, 'A')
+})
+test('receiver never initiates; sends answer to trusted sender ID', async t => {
+  const { session, ws, accept, ready } = await mount(t)
+  accept(); ready('S'); await flush()
+  assert.equal(ws.sent.length, 0)
+  ws.receive('offer', { type: 'offer', sdp: 'remote' }, 'S')
+  await flush()
+  assert.equal(session.peers.get('S').pc.channels.length, 0)
+  assert.equal(ws.sent.at(-1).type, 'answer')
+  assert.equal(ws.sent.at(-1).to, 'S')
+})
+test('ICE queues are isolated by peer ID', async t => {
+  const { session, ws, accept, ready } = await mount(t, 'sender')
+  accept(); ready('A'); ready('B'); await flush()
+  ws.receive('candidate', { candidate: 'ice-A' }, 'A')
+  ws.receive('candidate', { candidate: 'ice-B' }, 'B')
+  ws.receive('answer', { type: 'answer', sdp: 'a' }, 'A')
+  await flush()
+  assert.deepEqual(session.peers.get('A').pc.candidates, [{ candidate: 'ice-A' }])
+  assert.deepEqual(session.peers.get('B').pc.candidates, [])
+  assert.equal(session.peers.get('B').candidates.length, 1)
+})
+test('reset cancels only departed peer and invalidates its pending offer', async t => {
+  const { session, ws, accept, ready } = await mount(t, 'sender')
+  accept(); ready('A')
+  const old = session.peers.get('A')
+  let release
+  old.pc.createOffer = () => new Promise(resolve => { release = resolve })
+  await flush()
+  ready('B'); await flush()
+  ws.receive('reset', 'reset', 'A')
+  release({ type: 'offer', sdp: 'stale' }); await flush()
+  assert.equal(session.peers.has('A'), false)
+  assert.equal(session.peers.get('B').status, 'negotiating')
+  assert.deepEqual(ws.sent.filter(msg => msg.type === 'offer').map(msg => msg.to), ['B'])
+  assert.equal(session.accepted.value, true)
+  ready('C'); await flush()
+  assert.equal(ws.sent.at(-1).to, 'C')
+})
+test('peer failure does not close other devices or signaling', async t => {
+  const { session, accept, ready } = await mount(t, 'sender')
+  accept(); ready('A'); ready('B'); await flush()
+  session.peers.get('B').channel.open()
+  session.failPeer('A', new Error('test failure'))
+  assert.equal(session.peers.get('B').connected, true)
+  assert.equal(session.accepted.value, true)
+})
+test('screen renegotiation requested during initial offer waits for answer', async t => {
+  const { session, ws, accept, ready } = await mount(t, 'sender', 'screen')
+  accept(); ready('A'); await flush()
+  await session.offer('A')
+  assert.equal(ws.sent.filter(msg => msg.type === 'offer').length, 1)
+  ws.receive('answer', { type: 'answer', sdp: 'initial-answer' }, 'A')
+  await flush()
+  assert.equal(ws.sent.filter(msg => msg.type === 'offer').length, 2)
+})
+test('one peer setup error does not terminate the room or another peer', async t => {
+  const { session, accept, ready } = await mount(t, 'sender', 'screen', { peer(peer) { if (peer.id === 'B') throw new Error('track failure') } })
+  accept(); ready('A'); ready('B'); await flush()
+  assert.equal(session.accepted.value, true)
+  assert.equal(session.peers.get('A').status, 'negotiating')
+  assert.equal(session.peers.get('B').status, 'failed')
+})
+test('nonfatal route error does not remove any peer', async t => {
+  const { session, ws, accept, ready } = await mount(t, 'sender')
+  accept(); ready('A'); ready('B')
+  ws.receive('error', { code: 'TARGET_NOT_FOUND', fatal: false })
+  assert.equal(session.peers.size, 2)
+  assert.equal(session.accepted.value, true)
+  assert.match(session.error.value, /目标设备/)
+})
+test('fatal business error clears invalid credentials and survives generic close', async t => {
+  const { session, ws } = await mount(t, 'sender')
+  ws.receive('error', { code: 'SENDER_UNAUTHORIZED', closeCode: 4403 })
+  ws.onclose?.({ code: 1006 })
+  assert.match(session.error.value, /凭证/)
+  assert.equal(session.canReconnect.value, false)
+})
+test('transient close permits reconnect to same room without creating another room', async t => {
+  const { session, ws, accept, ready } = await mount(t, 'sender')
+  accept(); ready('A'); await flush()
+  const count = requests
+  ws.onclose({ code: 4001 })
+  assert.equal(session.peers.size, 0)
+  assert.equal(session.canReconnect.value, true)
+  await session.reconnect()
+  const next = Socket.instances.at(-1)
+  assert.equal(next.url.searchParams.get('senderToken'), token)
+  assert.equal(requests, count)
+  assert.equal(session.accepted.value, false)
+})
+test('receiver waits for returning sender after reset', async t => {
+  const { session, ws, accept, ready } = await mount(t)
+  accept(); ready('old-sender'); ws.receive('reset', 'reset', 'old-sender')
+  assert.equal(session.accepted.value, true)
+  ready('new-sender')
+  assert.equal(session.peers.size, 1)
+  assert.ok(session.peers.has('new-sender'))
+})
+test('reserved messages cannot be sent by client', async t => {
+  const { session, accept, ready } = await mount(t, 'sender')
+  accept(); ready('A')
+  for (const type of ['accepted', 'peer-ready', 'reset', 'error', 'joined']) assert.throws(() => session.send('A', type), /保留/)
+})
+test('invalid code does not open WebSocket; mixed case is preserved', async t => {
+  const { session, ws } = await mount(t)
+  session.disconnect()
   const count = Socket.instances.length
   await session.connect('abcdefg')
   assert.equal(Socket.instances.length, count)
   assert.equal(ws.url.searchParams.get('code'), 'Ab3xY9')
-  assert.match(session.error.value, /6 位/)
 })
-test('screen also negotiates a control channel before capturing media', async t => {
-  const { session, ws } = await mount(t, 'receiver', 'screen')
-  ws.receive('joined', 'joined')
-  await flush()
-  assert.equal(session.peer.value.channels.length, 1)
-  assert.equal(ws.sent.at(-1).type, 'offer')
-})
-test('malformed signal cleans up the current session', async t => {
-  const { session, ws } = await mount(t)
-  ws.onmessage({ data: '{' })
-  assert.equal(session.isWs.value, false)
+test('malformed signal cleans up the session', async t => {
+  const { session, ws, accept } = await mount(t)
+  accept(); ws.onmessage({ data: '{' })
+  assert.equal(session.accepted.value, false)
   assert.ok(session.error.value)
+})
+
+class FileChannel extends EventTarget {
+  readyState = 'open'
+  bufferedAmount = 0
+  headers = []
+  send(data) {
+    if (typeof data !== 'string') return
+    const msg = JSON.parse(data)
+    if (msg.type === 'file-info') this.headers.push(msg)
+    if (msg.type === 'file-end') {
+      const header = this.headers.at(-1)
+      this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ type: 'file-ack', fileId: msg.fileId, size: header.size, sha256: header.sha256 }) }))
+    }
+  }
+}
+const device = id => ({ id, connected: true, channel: new FileChannel(), pc: {} })
+async function until(predicate) { for (let i = 0; i < 200; i++) { if (predicate()) return; await new Promise(resolve => setTimeout(resolve, 5)) }; throw new Error('condition timed out') }
+test('two independent file recipients complete; late peer receives once from the beginning', async () => {
+  const distribution = useFileDistribution((_, error) => { throw error })
+  const a = device('A'), b = device('B'), c = device('C')
+  distribution.publish([new File(['v3-data'], 'test.txt')], [a, b])
+  await until(() => distribution.list.value.every(item => item.state === 'done'))
+  distribution.enqueue(c); distribution.enqueue(a)
+  await until(() => distribution.transfers.get('C').state === 'done')
+  assert.equal(a.channel.headers.length, 1)
+  assert.equal(b.channel.headers.length, 1)
+  assert.equal(c.channel.headers.length, 1)
+  distribution.clear()
+})
+test('cancel stalled recipient leaves other transfer healthy and starts queued recipient', async () => {
+  const distribution = useFileDistribution(() => {})
+  const a = device('A'), b = device('B'), c = device('C')
+  a.channel.bufferedAmount = 300000
+  distribution.publish([new File(['v3-data'], 'test.txt')], [a, b, c])
+  assert.equal(distribution.transfers.get('C').state, 'queued')
+  distribution.remove('A')
+  await until(() => distribution.transfers.get('B').state === 'done' && distribution.transfers.get('C').state === 'done')
+  assert.equal(a.channel.headers.length, 0)
+  distribution.clear()
 })
