@@ -1,126 +1,116 @@
 ﻿<script setup lang="ts">
-import { onBeforeUnmount, ref } from 'vue'
+import { onBeforeUnmount, ref, computed } from 'vue'
 import SessionPanel from './SessionPanel.vue'
 import { useSession } from '../composables/useSession'
-import { confirmFile, sendFileQueue } from '../util/fileTransfer'
+import { useFileDistribution } from '../composables/useFileDistribution'
+import { fileHash, MAX_FILE_SIZE } from '../util/fileTransfer'
 const files = ref<File[]>([])
-const active = ref(false)
+const dragging = ref(false)
+const downloads = ref<{ name: string; url: string }[]>([])
+const receiving = ref(false)
 const paused = ref(false)
 const progress = ref(0)
 const filename = ref('')
-const dragging = ref(false)
-const downloads = ref<{ name: string; url: string }[]>([])
-let controller = new AbortController()
-let buffers: ArrayBuffer[] = []
-let expected = 0
-let received = 0
-let hasHeader = false
-let fileId = ''
-let mimeType = ''
+const distribution = useFileDistribution((id, error) => session.failPeer(id, error))
 const session = useSession('file', {
-  channel(channel) {
+  connected(peer) { if (session.role === 'sender') distribution.enqueue(peer) },
+  channel(channel, peer) {
+    if (session.role !== 'receiver') return
     channel.binaryType = 'arraybuffer'
-    channel.onmessage = (event) => {
-      if (session.role !== 'receiver') return
-      try {
+    let buffers: ArrayBuffer[] = []
+    let header: { fileId: string; name: string; size: number; mimeType: string; sha256: string } | null = null
+    let received = 0
+    let queue = Promise.resolve()
+    const current = () => session.peers.get(peer.id) === peer && peer.status !== 'failed'
+    channel.onmessage = event => {
+      queue = queue.then(async () => {
+        if (!current()) return
         if (typeof event.data === 'string') {
           const msg = JSON.parse(event.data)
           if (msg.type === 'file-info') {
-            if (hasHeader || typeof msg.fileId !== 'string' || !msg.fileId || typeof msg.name !== 'string' || !Number.isSafeInteger(msg.size) || msg.size < 0) throw new Error('文件信息无效，请确认双方使用相同版本前端')
-            fileId = msg.fileId
-            mimeType = typeof msg.mimeType === 'string' ? msg.mimeType : ''
+            if (header || typeof msg.fileId !== 'string' || !msg.fileId || typeof msg.name !== 'string' || !Number.isSafeInteger(msg.size) || msg.size < 0 || msg.size > MAX_FILE_SIZE || !/^[a-f0-9]{64}$/.test(msg.sha256)) throw new Error('文件信息无效或超过 256 MB，请确认双方前端版本一致')
+            header = msg
             filename.value = msg.name
-            expected = msg.size
             received = 0
             buffers = []
-            hasHeader = true
-            active.value = true
+            receiving.value = true
             progress.value = 0
           } else if (msg.type === 'file-end') {
-            if (!hasHeader || msg.fileId !== fileId || received !== expected) throw new Error('文件接收不完整，请重新接收')
-            downloads.value.push({ name: filename.value, url: URL.createObjectURL(new Blob(buffers, { type: mimeType })) })
-            channel.send(JSON.stringify({ type: 'file-ack', fileId, size: received }))
+            if (!header || msg.fileId !== header.fileId || received !== header.size) throw new Error('文件接收不完整')
+            const blob = new Blob(buffers, { type: header.mimeType })
+            const hash = await fileHash(blob)
+            if (!current()) return
+            if (hash !== header.sha256) throw new Error('文件哈希校验失败，请重新接收')
+            channel.send(JSON.stringify({ type: 'file-ack', fileId: header.fileId, size: received, sha256: hash }))
+            downloads.value.push({ name: header.name, url: URL.createObjectURL(blob) })
             buffers = []
-            hasHeader = false
+            header = null
+            receiving.value = false
             progress.value = 100
-            active.value = false
           }
         } else {
-          if (!hasHeader || !(event.data instanceof ArrayBuffer) || received + event.data.byteLength > expected) throw new Error('文件数据异常，请重新连接')
+          if (!header || !(event.data instanceof ArrayBuffer) || received + event.data.byteLength > header.size) throw new Error('文件分片异常')
           buffers.push(event.data)
           received += event.data.byteLength
-          progress.value = expected ? received / expected * 100 : 100
+          progress.value = header.size ? Math.min(99, received / header.size * 100) : 0
         }
-      } catch (err) { session.disconnect(); session.report(err) }
+      }).catch(error => { buffers = []; header = null; if (current()) session.failPeer(peer.id, error) })
     }
-    channel.addEventListener('close', () => { active.value = false; buffers = []; hasHeader = false })
+    channel.addEventListener('close', () => { buffers = []; header = null })
   },
-  message(type) {
+  message(type, peer) {
     if (session.role !== 'sender') return
-    if (type === 'file-start') void sendFiles()
-    if (type === 'file-pause') paused.value = true
-    if (type === 'file-resume') paused.value = false
+    if (type === 'file-start') distribution.enqueue(peer)
+    if (type === 'file-pause') distribution.pause(peer.id, true)
+    if (type === 'file-resume') distribution.pause(peer.id, false)
   },
-  cleanup() {
-    controller.abort()
-    active.value = paused.value = false
-    buffers = []
-    hasHeader = false
-    filename.value = ''
-    progress.value = expected = received = 0
-    fileId = mimeType = ''
+  peerCleanup(peer) {
+    distribution.remove(peer.id)
+    if (session.role === 'receiver') { receiving.value = paused.value = false; progress.value = 0; filename.value = '' }
   },
+  cleanup() { distribution.clear() },
 })
+const sender = computed(() => session.connectedPeers.value[0])
 function select(list: FileList | null) {
-  if (list && !active.value) files.value = Array.from(list)
+  if (!list || distribution.active.value) return
+  if (Array.from(list).some(file => file.size > MAX_FILE_SIZE)) { session.error.value = '当前支持单文件不超过 256 MB，请分批或拆分文件'; return }
+  distribution.clear()
+  files.value = Array.from(list)
 }
-function pick(event: Event) {
-  const input = event.target as HTMLInputElement
-  select(input.files)
-  input.value = ''
-}
+function pick(event: Event) { const input = event.target as HTMLInputElement; select(input.files); input.value = '' }
 function drop(event: DragEvent) { dragging.value = false; select(event.dataTransfer?.files ?? null) }
-function size(value: number) {
-  return value < 1024 ? value + ' B' : value < 1048576 ? (value / 1024).toFixed(1) + ' KB' : (value / 1048576).toFixed(1) + ' MB'
-}
-async function sendFiles() {
-  const channel = session.channel.value
-  if (active.value || !channel || channel.readyState !== 'open') return
-  if (!files.value.length) { session.notice.value = '请先选择文件，然后点击发送文件'; return }
-  controller = new AbortController()
-  const transfer = controller
-  active.value = true
-  paused.value = false
-  try {
-    await sendFileQueue(files.value, channel, transfer.signal, () => paused.value, (name, percent) => { filename.value = name; progress.value = percent }, {
-      maxMessageSize: session.peer.value?.sctp?.maxMessageSize,
-      confirm: (fileId, size) => confirmFile(channel, transfer.signal, fileId, size),
-    })
-  } catch (err) { if (!transfer.signal.aborted) { session.disconnect(); session.report(err) } }
-  finally { if (controller === transfer) active.value = false }
-}
-function requestFiles() {
-  try { session.send('file-start'); session.notice.value = '已请求发送，请等待发送方选择并发送文件' }
-  catch (err) { session.report(err) }
+function size(value: number) { return value < 1024 ? value + ' B' : value < 1048576 ? (value / 1024).toFixed(1) + ' KB' : (value / 1048576).toFixed(1) + ' MB' }
+function publish() {
+  distribution.publish(files.value, session.connectedPeers.value)
+  session.notice.value = '已开启分发；后加入的设备会从头接收当前文件，每次最多向两台设备同时发送'
 }
 function togglePause() {
-  try { session.send(paused.value ? 'file-resume' : 'file-pause'); paused.value = !paused.value }
-  catch (err) { session.report(err) }
+  if (!sender.value) return
+  try { session.send(sender.value.id, paused.value ? 'file-resume' : 'file-pause'); paused.value = !paused.value }
+  catch (error) { session.report(error) }
 }
-onBeforeUnmount(() => downloads.value.forEach((file) => URL.revokeObjectURL(file.url)))
+function clearDownloads() { downloads.value.forEach(file => URL.revokeObjectURL(file.url)); downloads.value = [] }
+onBeforeUnmount(clearDownloads)
 </script>
 <template>
-  <SessionPanel title="文件传输" description="选择文件，让两台设备直接传递。" :session="session">
+  <SessionPanel title="文件传输" description="一个房间，多台设备分别接收，独立查看传输进度。" :session="session">
     <template v-if="session.role === 'sender'">
       <label class="drop-zone" :class="{ dragging }" @dragover.prevent="dragging = true" @dragleave.prevent="dragging = false" @drop.prevent="drop">
-        <span class="upload-icon" aria-hidden="true">↑</span><strong>拖拽文件到这里</strong><span>或点击选择文件，支持多选</span>
-        <input class="sr-only" type="file" multiple :disabled="active" @change="pick" />
+        <span class="upload-icon" aria-hidden="true">↑</span><strong>拖拽文件到这里</strong><span>支持多选，单文件最多 256 MB</span>
+        <input class="sr-only" type="file" multiple :disabled="distribution.active.value" @change="pick" />
       </label>
       <ul v-if="files.length" class="file-list"><li v-for="(file, index) in files" :key="index"><span>{{ file.name }}</span><small>{{ size(file.size) }}</small></li></ul>
-      <div class="action-row"><span class="muted">已选择 {{ files.length }} 个文件</span><button class="button primary" :disabled="!session.connected.value || !files.length || active" @click="sendFiles">{{ active ? '正在发送…' : '发送文件' }}</button></div>
+      <div class="action-row"><span class="muted">已选择 {{ files.length }} 个文件 · 每台设备各占一份上传带宽</span><button class="button primary" :disabled="!files.length || distribution.active.value" @click="publish">发送给所有接收者</button></div>
+      <div v-for="item in distribution.list.value" :key="item.peer.id" class="transfer-progress">
+        <div class="content-heading"><span>{{ item.peer.id }} · {{ item.name || '等待发送' }}</span><span>{{ item.progress.toFixed(1) }}%</span></div>
+        <progress :value="item.progress" max="100" :aria-label="item.peer.id + ' 的传输进度'" />
+        <div class="action-row"><span class="muted">{{ item.state === 'done' ? '已完成并通过完整性校验' : item.state === 'queued' ? '排队等待发送' : item.paused ? '该设备已暂停' : item.state === 'failed' ? item.error : '正在发送 / 等待确认' }}</span><button v-if="item.state === 'queued' || item.state === 'sending'" class="button secondary" @click="session.failPeer(item.peer.id, '已取消该设备传输，请重新加入以接收')">取消此设备传输</button></div>
+      </div>
     </template>
-    <div v-else class="receive-area"><span class="upload-icon" aria-hidden="true">↓</span><h3>准备接收文件</h3><p class="muted">发送方选择文件后可直接发送，也可以请求对方开始传输。</p><button class="button primary" :disabled="!session.connected.value || active" @click="requestFiles">请求接收文件</button></div>
-    <div v-if="filename" class="transfer-progress"><div class="content-heading"><span>{{ filename }}</span><span>{{ progress.toFixed(1) }}%</span></div><progress :value="progress" max="100" aria-label="文件传输进度" /><div class="action-row"><span class="muted">{{ active ? paused ? '传输已暂停' : '正在传输…' : progress === 100 ? '传输完成' : '传输已中断' }}</span><button v-if="session.role === 'receiver' && active" class="button secondary" @click="togglePause">{{ paused ? '继续接收' : '暂停接收' }}</button></div></div>
+    <div v-else class="receive-area"><span class="upload-icon" aria-hidden="true">↓</span><h3>等待发送方分发文件</h3><p class="muted">连接后自动接收已发布的文件；重新加入会从头开始。</p>
+      <div v-if="filename" class="transfer-progress"><div class="content-heading"><span>{{ filename }}</span><span>{{ progress.toFixed(1) }}%</span></div><progress :value="progress" max="100" aria-label="接收进度" /><div class="action-row"><span class="muted">{{ receiving ? paused ? '已暂停' : '正在接收 / 校验' : '接收完成，校验通过' }}</span><button v-if="receiving" class="button secondary" @click="togglePause">{{ paused ? '继续接收' : '暂停接收' }}</button></div></div>
+    </div>
     <ul v-if="downloads.length" class="file-list"><li v-for="(file, index) in downloads" :key="index"><span>{{ file.name }}</span><a :href="file.url" :download="file.name">保存文件 ↓</a></li></ul>
+    <button v-if="downloads.length" class="button secondary" @click="clearDownloads">清空下载列表并释放内存</button>
   </SessionPanel>
 </template>

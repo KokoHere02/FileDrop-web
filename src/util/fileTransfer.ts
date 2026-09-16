@@ -5,7 +5,7 @@ export async function sendFileQueue(
   signal: AbortSignal,
   paused: () => boolean,
   progress: (name: string, percent: number) => void,
-  options: { maxMessageSize?: number; confirm?: (fileId: string, size: number) => Promise<void> } = {},
+  options: { maxMessageSize?: number; confirm?: (fileId: string, size: number, sha256: string) => Promise<void> } = {},
 ) {
   const limit = options.maxMessageSize && options.maxMessageSize > 0 ? options.maxMessageSize : 16 * 1024
   const chunkSize = Math.min(16 * 1024, limit)
@@ -21,9 +21,10 @@ export async function sendFileQueue(
     }
   }
   for (const file of files) {
+    const sha256 = options.confirm ? await fileHash(file) : ''
     await ready()
     const fileId = crypto.randomUUID()
-    const header = JSON.stringify({ type: 'file-info', fileId, name: file.name, size: file.size, mimeType: file.type })
+    const header = JSON.stringify({ type: 'file-info', fileId, name: file.name, size: file.size, mimeType: file.type, sha256 })
     if (new TextEncoder().encode(header).length > limit) throw new Error('文件信息超过通道消息大小限制')
     channel.send(header)
     progress(file.name, 0)
@@ -35,14 +36,14 @@ export async function sendFileQueue(
       progress(file.name, Math.min(99, offset / file.size * 100))
     }
     await ready()
-    if (options.confirm) await options.confirm(fileId, file.size)
+    if (options.confirm) await options.confirm(fileId, file.size, sha256)
     else channel.send(JSON.stringify({ type: 'file-end', fileId }))
     progress(file.name, 100)
   }
 }
 
 /** 在发送结束标记之前监听确认，100% 表示对端已核对接收字节数。 */
-export function confirmFile(channel: RTCDataChannel, signal: AbortSignal, fileId: string, size: number): Promise<void> {
+export function confirmFile(channel: RTCDataChannel, signal: AbortSignal, fileId: string, size: number, sha256?: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const cleanup = () => {
       clearTimeout(timer)
@@ -56,7 +57,7 @@ export function confirmFile(channel: RTCDataChannel, signal: AbortSignal, fileId
       try {
         const msg = JSON.parse(event.data)
         if (msg.type === 'file-ack' && msg.fileId === fileId) {
-          finish(msg.size === size ? undefined : new Error('对端确认的文件大小不一致'))
+          finish(msg.size !== size ? new Error('对端确认的文件大小不一致') : sha256 && msg.sha256 !== sha256 ? new Error('对端文件哈希校验失败') : undefined)
         }
       } catch { /* 无关消息由页面处理器解析。 */ }
     }
@@ -71,4 +72,19 @@ export function confirmFile(channel: RTCDataChannel, signal: AbortSignal, fileId
     try { channel.send(JSON.stringify({ type: 'file-end', fileId })) }
     catch (err) { finish(err instanceof Error ? err : new Error('发送文件结束标记失败')) }
   })
+}
+
+export const MAX_FILE_SIZE = 256 * 1024 * 1024
+const hashes = new WeakMap<Blob, Promise<string>>()
+export function fileHash(file: Blob): Promise<string> {
+  let hash = hashes.get(file)
+  if (!hash) {
+    hash = (async () => {
+      if (!globalThis.crypto?.subtle) throw new Error('文件完整性校验需要 HTTPS 或 localhost 安全环境')
+      const digest = await crypto.subtle.digest('SHA-256', await file.arrayBuffer())
+      return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('')
+    })()
+    hashes.set(file, hash)
+  }
+  return hash
 }

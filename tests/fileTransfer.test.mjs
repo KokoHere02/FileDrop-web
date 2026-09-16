@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { confirmFile, sendFileQueue } from '../src/util/fileTransfer.ts'
+import { confirmFile, fileHash, sendFileQueue } from '../src/util/fileTransfer.ts'
 
 function setup() {
   const sent = []
@@ -109,4 +109,13 @@ test('abort while waiting for acknowledgement rejects promptly', async () => {
   const task = confirmFile(channel, controller.signal, 'id', 10)
   controller.abort()
   await assert.rejects(task, { name: 'AbortError' })
+})
+
+test('SHA-256 matches known bytes and rejects mismatched content acknowledgement', async () => {
+  const hash = await fileHash(new Blob(['hello']))
+  assert.equal(hash, '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824')
+  const channel = new AckChannel()
+  const task = confirmFile(channel, new AbortController().signal, 'id', 5, hash)
+  channel.dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ type: 'file-ack', fileId: 'id', size: 5, sha256: '0'.repeat(64) }) }))
+  await assert.rejects(task, /哈希校验失败/)
 })
