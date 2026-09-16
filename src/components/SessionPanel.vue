@@ -18,9 +18,14 @@ const code = ref('')
         <input v-if="session.role === 'receiver'" id="room-code" v-model="code" placeholder="6 位取件码，区分大小写" autocomplete="off" autocapitalize="off" :spellcheck="false" :disabled="session.busy.value" />
         <button class="button primary" :disabled="session.busy.value">{{ session.busy.value ? '正在连接…' : session.role === 'sender' ? '创建房间 →' : '加入房间 →' }}</button>
       </form>
+      <button v-if="session.canReconnect.value" class="button secondary" :disabled="session.busy.value" @click="session.reconnect">重新连接原房间</button>
     </div>
     <div v-else class="session-grid">
-      <div class="content-card"><slot /></div>
+      <div class="content-card"><slot />
+        <ul class="file-list" aria-label="连接设备">
+          <li v-for="peer in session.peerList.value" :key="peer.id"><span>{{ peer.id }} · {{ peer.status === 'connected' ? '已连接' : peer.status === 'failed' ? peer.error : '正在连接' }}</span></li>
+        </ul>
+      </div>
       <aside class="code-card"><span class="eyebrow">ROOM CODE</span><h3>房间取件码</h3><p>在另一台设备上选择相同的传输方式，并输入下方取件码。</p><strong class="room-code">{{ session.roomId.value }}</strong><button class="button primary" @click="session.copy(session.roomId.value)">复制取件码</button><button class="button secondary" @click="session.disconnect">结束连接</button></aside>
     </div>
   </section>
