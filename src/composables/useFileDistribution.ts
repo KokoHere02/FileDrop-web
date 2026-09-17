@@ -2,20 +2,33 @@ import { computed, shallowReactive } from 'vue'
 import type { SessionPeer } from './useSession'
 import { confirmFile, sendFileQueue } from '../util/fileTransfer'
 
+interface Transfer {
+  peer: SessionPeer; controller: AbortController; files: File[]; paused: boolean;
+  state: 'queued' | 'sending' | 'done' | 'failed'; name: string; progress: number; error: string;
+}
+
 export function useFileDistribution(onFailure: (id: string, error: unknown) => void) {
-  const transfers = shallowReactive(new Map<string, {
-    peer: SessionPeer; controller: AbortController; files: File[]; paused: boolean;
-    state: 'queued' | 'sending' | 'done' | 'failed'; name: string; progress: number; error: string;
-  }>())
+  const transfers = shallowReactive(new Map<string, Transfer>())
   let published: File[] = []
-  let running = 0
+  // A paused queue keeps its file offset, but releases its sending slot.
+  const slots = new Set<Transfer>()
+  const started = new WeakSet<Transfer>()
   const list = computed(() => [...transfers.values()])
   const active = computed(() => list.value.some(item => item.state === 'queued' || item.state === 'sending'))
   function remove(id: string) {
-    transfers.get(id)?.controller.abort()
+    const item = transfers.get(id)
+    if (!item) return
+    item.controller.abort()
+    slots.delete(item)
     transfers.delete(id)
+    pump()
   }
-  function clear() { published = []; for (const id of [...transfers.keys()]) remove(id) }
+  function clear() {
+    published = []
+    for (const item of transfers.values()) item.controller.abort()
+    transfers.clear()
+    slots.clear()
+  }
   function enqueue(peer: SessionPeer) {
     if (!published.length || !peer.connected || transfers.has(peer.id)) return
     transfers.set(peer.id, shallowReactive({ peer, controller: new AbortController(), files: [...published], paused: false, state: 'queued', name: '', progress: 0, error: '' }))
@@ -29,13 +42,15 @@ export function useFileDistribution(onFailure: (id: string, error: unknown) => v
   }
   function pump() {
     for (const item of transfers.values()) {
-      if (running >= 2) break
-      if (item.state !== 'queued') continue
+      if (slots.size >= 2) break
+      if (item.state !== 'queued' || item.paused) continue
       const channel = item.peer.channel
       if (!channel || channel.readyState !== 'open') { item.state = 'failed'; item.error = '传输通道尚未就绪'; continue }
-      running++
+      slots.add(item)
       item.state = 'sending'
-      void sendFileQueue(item.files, channel, item.controller.signal, () => item.paused, (name, progress) => {
+      if (started.has(item)) continue
+      started.add(item)
+      void sendFileQueue(item.files, channel, item.controller.signal, () => item.paused || !slots.has(item), (name, progress) => {
         item.name = name; item.progress = progress
       }, {
         maxMessageSize: item.peer.pc.sctp?.maxMessageSize,
@@ -46,9 +61,15 @@ export function useFileDistribution(onFailure: (id: string, error: unknown) => v
           item.error = error instanceof Error ? error.message : '传输失败'
           onFailure(item.peer.id, error)
         }
-      }).finally(() => { running--; pump() })
+      }).finally(() => { slots.delete(item); pump() })
     }
   }
-  function pause(id: string, value: boolean) { const item = transfers.get(id); if (item) item.paused = value }
+  function pause(id: string, value: boolean) {
+    const item = transfers.get(id)
+    if (!item || (item.state !== 'queued' && item.state !== 'sending')) return
+    item.paused = value
+    if (value) { slots.delete(item); item.state = 'queued' }
+    pump()
+  }
   return { transfers, list, active, publish, enqueue, remove, clear, pause }
 }

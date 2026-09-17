@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 import { onBeforeUnmount, ref, computed } from 'vue'
 import SessionPanel from './SessionPanel.vue'
 import { useSession } from '../composables/useSession'
@@ -104,11 +104,11 @@ onBeforeUnmount(clearDownloads)
       <div v-for="item in distribution.list.value" :key="item.peer.id" class="transfer-progress">
         <div class="content-heading"><span>{{ item.peer.id }} · {{ item.name || '等待发送' }}</span><span>{{ item.progress.toFixed(1) }}%</span></div>
         <progress :value="item.progress" max="100" :aria-label="item.peer.id + ' 的传输进度'" />
-        <div class="action-row"><span class="muted">{{ item.state === 'done' ? '已完成并通过完整性校验' : item.state === 'queued' ? '排队等待发送' : item.paused ? '该设备已暂停' : item.state === 'failed' ? item.error : '正在发送 / 等待确认' }}</span><button v-if="item.state === 'queued' || item.state === 'sending'" class="button secondary" @click="session.failPeer(item.peer.id, '已取消该设备传输，请重新加入以接收')">取消此设备传输</button></div>
+        <div class="action-row"><span class="muted">{{ item.state === 'done' ? '已完成并通过完整性校验' : item.paused ? '该设备已暂停' : item.state === 'queued' ? '排队等待发送' : item.state === 'failed' ? item.error : '正在发送 / 等待确认' }}</span><button v-if="item.state === 'queued' || item.state === 'sending'" class="button secondary" @click="session.failPeer(item.peer.id, '已取消该设备传输，请重新加入以接收')">取消此设备传输</button></div>
       </div>
     </template>
     <div v-else class="receive-area"><span class="upload-icon" aria-hidden="true">↓</span><h3>等待发送方分发文件</h3><p class="muted">连接后自动接收已发布的文件；重新加入会从头开始。</p>
-      <div v-if="filename" class="transfer-progress"><div class="content-heading"><span>{{ filename }}</span><span>{{ progress.toFixed(1) }}%</span></div><progress :value="progress" max="100" aria-label="接收进度" /><div class="action-row"><span class="muted">{{ receiving ? paused ? '已暂停' : '正在接收 / 校验' : '接收完成，校验通过' }}</span><button v-if="receiving" class="button secondary" @click="togglePause">{{ paused ? '继续接收' : '暂停接收' }}</button></div></div>
+      <div v-if="filename" class="transfer-progress"><div class="content-heading"><span>{{ filename }}</span><span>{{ progress.toFixed(1) }}%</span></div><progress :value="progress" max="100" aria-label="接收进度" /><div class="action-row"><span class="muted">{{ paused ? '已暂停' : receiving ? '正在接收 / 校验' : '接收完成，校验通过' }}</span><button v-if="receiving || paused" class="button secondary" @click="togglePause">{{ paused ? '继续接收' : '暂停接收' }}</button></div></div>
     </div>
     <ul v-if="downloads.length" class="file-list"><li v-for="(file, index) in downloads" :key="index"><span>{{ file.name }}</span><a :href="file.url" :download="file.name">保存文件 ↓</a></li></ul>
     <button v-if="downloads.length" class="button secondary" @click="clearDownloads">清空下载列表并释放内存</button>

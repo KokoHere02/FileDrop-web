@@ -1,4 +1,4 @@
-﻿import { test, after } from 'node:test'
+import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { build } from 'esbuild'
 import { createRenderer } from 'vue'
@@ -245,4 +245,61 @@ test('cancel stalled recipient leaves other transfer healthy and starts queued r
   await until(() => distribution.transfers.get('B').state === 'done' && distribution.transfers.get('C').state === 'done')
   assert.equal(a.channel.headers.length, 0)
   distribution.clear()
+})
+
+test('paused recipients release slots and resume within the two-device limit without restarting files', async t => {
+  const failures = []
+  const distribution = useFileDistribution((id, error) => failures.push({ id, error }))
+  t.after(() => distribution.clear())
+  const devices = ['A', 'B', 'C', 'D'].map(device)
+  const bytes = new Uint8Array(50000).fill(17)
+  const received = new Map()
+  for (const peer of devices) {
+    const chunks = []
+    received.set(peer.id, chunks)
+    const send = peer.channel.send.bind(peer.channel)
+    peer.channel.send = data => {
+      if (typeof data !== 'string') {
+        chunks.push(data)
+        // Stop after the first chunk so pauses happen midway through a file.
+        if (chunks.length === 1) peer.channel.bufferedAmount = 300000
+      }
+      send(data)
+    }
+  }
+  distribution.publish([new File([bytes], 'payload.bin')], devices)
+  await until(() => received.get('A').length === 1 && received.get('B').length === 1)
+  distribution.pause('A', true)
+  distribution.pause('B', true)
+  await until(() => received.get('C').length === 1 && received.get('D').length === 1)
+  distribution.pause('A', false)
+  distribution.pause('B', false)
+  devices[0].channel.bufferedAmount = devices[1].channel.bufferedAmount = 0
+  await new Promise(resolve => setTimeout(resolve, 60))
+  assert.equal(received.get('A').length, 1)
+  assert.equal(received.get('B').length, 1)
+  assert.equal(distribution.transfers.get('A').state, 'queued')
+  assert.equal(distribution.list.value.filter(item => item.state === 'sending').length, 2)
+  devices[2].channel.bufferedAmount = devices[3].channel.bufferedAmount = 0
+  await until(() => distribution.list.value.every(item => item.state === 'done'))
+  for (const peer of devices) {
+    assert.equal(peer.channel.headers.length, 1)
+    assert.deepEqual(new Uint8Array(await new Blob(received.get(peer.id)).arrayBuffer()), bytes)
+  }
+  assert.deepEqual(failures, [])
+})
+
+test('removing paused tasks and clearing old queues does not consume new sending slots', async t => {
+  const distribution = useFileDistribution(() => {})
+  t.after(() => distribution.clear())
+  const a = device('A'), b = device('B'), c = device('C')
+  a.channel.bufferedAmount = b.channel.bufferedAmount = 300000
+  distribution.publish([new File(['old'], 'old.txt')], [a, b, c])
+  distribution.pause('A', true)
+  distribution.remove('A')
+  distribution.clear()
+  const next = ['A', 'B', 'C'].map(device)
+  distribution.publish([new File(['new'], 'new.txt')], next)
+  await until(() => distribution.list.value.every(item => item.state === 'done'))
+  for (const peer of next) assert.deepEqual(peer.channel.headers.map(header => header.name), ['new.txt'])
 })
