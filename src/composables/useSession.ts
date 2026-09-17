@@ -14,6 +14,7 @@ export interface SessionPeer {
   candidates: RTCIceCandidateInit[]
   queue: Promise<void>
   timer?: ReturnType<typeof setTimeout>
+  disconnectTimer?: ReturnType<typeof setTimeout>
   pendingOffer: boolean
 }
 interface Signal { type: string; from?: string; to?: string; payload?: unknown }
@@ -26,6 +27,7 @@ interface SessionOptions {
   cleanup?: () => void
 }
 const RESERVED = new Set(['accepted', 'peer-ready', 'reset', 'error', 'joined'])
+const DISCONNECT_GRACE_MS = 15000
 
 export function useSession(type: TransferType, options: SessionOptions = {}) {
   const role = useRoomStore().role
@@ -41,7 +43,8 @@ export function useSession(type: TransferType, options: SessionOptions = {}) {
   const peerList = computed(() => [...peers.values()])
   const connectedPeers = computed(() => peerList.value.filter(peer => peer.connected))
   const connected = computed(() => connectedPeers.value.length > 0)
-  const status = computed(() => busy.value ? '正在加入房间' : connected.value
+  const status = computed(() => busy.value ? '正在加入房间' : peerList.value.some(peer => peer.disconnectTimer !== undefined)
+    ? '网络暂时中断，正在等待恢复' : connected.value
     ? role === 'sender' ? `${connectedPeers.value.length} 台设备已连接` : '设备已连接'
     : peerList.value.some(peer => peer.status === 'negotiating') ? '正在协商连接' : accepted.value ? '等待对方连接' : '未连接')
   let socket: WebSocket | null = null
@@ -55,6 +58,8 @@ export function useSession(type: TransferType, options: SessionOptions = {}) {
   function current(peer: SessionPeer) { return peers.get(peer.id) === peer && peer.status !== 'failed' }
   function disposePeer(peer: SessionPeer) {
     clearTimeout(peer.timer)
+    clearTimeout(peer.disconnectTimer)
+    peer.disconnectTimer = undefined
     peer.connected = false
     peer.candidates = []
     peer.pendingOffer = false
@@ -131,7 +136,18 @@ export function useSession(type: TransferType, options: SessionOptions = {}) {
     }
     pc.onconnectionstatechange = () => {
       if (!current(peer)) return
-      if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') failPeer(id, '设备连接已中断，请让该设备重新加入')
+      if (pc.connectionState === 'failed') failPeer(id, '设备连接已中断，请让该设备重新加入')
+      else if (pc.connectionState === 'connected') {
+        clearTimeout(peer.disconnectTimer)
+        peer.disconnectTimer = undefined
+      } else if (pc.connectionState === 'disconnected' && peer.disconnectTimer === undefined) {
+        // Keep the PC and channel alive while ICE attempts to recover. Repeated
+        // disconnected events must not extend the deadline indefinitely.
+        peer.disconnectTimer = setTimeout(() => {
+          peer.disconnectTimer = undefined
+          if (current(peer) && pc.connectionState !== 'connected') failPeer(id, '设备网络中断超过 15 秒，请让该设备重新加入')
+        }, DISCONNECT_GRACE_MS)
+      }
     }
     pc.ondatachannel = event => bindChannel(peer, event.channel)
     startTimer(peer)

@@ -23,7 +23,7 @@ const code = ref('')
     <div v-else class="session-grid">
       <div class="content-card"><slot />
         <ul class="file-list" aria-label="连接设备">
-          <li v-for="peer in session.peerList.value" :key="peer.id"><span>{{ peer.id }} · {{ peer.status === 'connected' ? '已连接' : peer.status === 'failed' ? peer.error : '正在连接' }}</span></li>
+          <li v-for="peer in session.peerList.value" :key="peer.id"><span>{{ peer.id }} · {{ peer.disconnectTimer !== undefined ? '网络暂时中断，正在等待恢复' : peer.status === 'connected' ? '已连接' : peer.status === 'failed' ? peer.error : '正在连接' }}</span></li>
         </ul>
       </div>
       <aside class="code-card"><span class="eyebrow">ROOM CODE</span><h3>房间取件码</h3><p>在另一台设备上选择相同的传输方式，并输入下方取件码。</p><strong class="room-code">{{ session.roomId.value }}</strong><button class="button primary" @click="session.copy(session.roomId.value)">复制取件码</button><button class="button secondary" @click="session.disconnect">结束连接</button></aside>
