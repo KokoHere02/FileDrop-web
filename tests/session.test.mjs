@@ -1,15 +1,30 @@
-import { test, after } from 'node:test'
+﻿import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { build } from 'esbuild'
 import { createRenderer } from 'vue'
 import { createPinia } from 'pinia'
 import axios from 'axios'
+import { readFile } from 'node:fs/promises'
+import { parse, compileScript } from '@vue/compiler-sfc'
+import { nextTick } from 'vue'
 
 const token = 'x'.repeat(43)
 let requests = 0
 axios.defaults.adapter = async config => { requests++; return { data: { code: 200, data: { code: 'Ab3xY9', senderToken: token } }, status: 200, statusText: 'OK', headers: {}, config } }
-await build({ stdin: { contents: "export { useSession } from './src/composables/useSession'; export { useRoomStore } from './src/store/RoomStore'; export { useFileDistribution } from './src/composables/useFileDistribution'", resolveDir: process.cwd() }, bundle: true, platform: 'node', format: 'esm', packages: 'external', define: { 'import.meta.env': '{}' }, outfile: 'node_modules/.tmp/session-test.mjs' })
-const { useSession, useRoomStore, useFileDistribution } = await import('../node_modules/.tmp/session-test.mjs')
+await build({ stdin: { contents: "export { useSession } from './src/composables/useSession'; export { useRoomStore } from './src/store/RoomStore'; export { useFileDistribution } from './src/composables/useFileDistribution'; export { default as Screen } from './src/components/Screen.vue'; export { getScreenSession } from 'screen-panel'", resolveDir: process.cwd() }, bundle: true, platform: 'node', format: 'esm', packages: 'external', define: { 'import.meta.env': '{}' }, outfile: 'node_modules/.tmp/session-test.mjs',
+  plugins: [{ name: 'screen-components', setup(build) {
+    build.onResolve({ filter: /(?:SessionPanel\.vue|^screen-panel)$/ }, () => ({ path: 'panel', namespace: 'screen-fixture' }))
+    build.onResolve({ filter: /ScreenViewer\.vue$/ }, () => ({ path: 'viewer', namespace: 'screen-fixture' }))
+    build.onLoad({ filter: /.*/, namespace: 'screen-fixture' }, ({ path }) => ({ contents: path === 'panel'
+      ? "let session; export const getScreenSession = () => session; export default { props: ['title', 'description', 'session'], setup(props, { slots }) { session = props.session; return () => slots.default?.() } }"
+      : "export default { props: ['stream', 'paused', 'placeholder'], setup() { return () => null } }", loader: 'js' }))
+    build.onLoad({ filter: /Screen\.vue$/ }, async ({ path }) => {
+      const { descriptor } = parse(await readFile(path, 'utf8'), { filename: path })
+      return { contents: compileScript(descriptor, { id: 'screen-test', inlineTemplate: true }).content, loader: 'ts' }
+    })
+  } }],
+})
+const { useSession, useRoomStore, useFileDistribution, Screen, getScreenSession } = await import('../node_modules/.tmp/session-test.mjs')
 const saved = { WebSocket: globalThis.WebSocket, RTCPeerConnection: globalThis.RTCPeerConnection, window: globalThis.window }
 after(() => Object.assign(globalThis, saved))
 class Channel extends EventTarget {
@@ -45,12 +60,27 @@ class Socket {
 globalThis.WebSocket = Socket
 globalThis.RTCPeerConnection = Peer
 globalThis.window = { location: { href: 'http://localhost:5173/' } }
-const renderer = createRenderer({ createComment: () => ({}), insert() {}, remove() {}, parentNode() {}, nextSibling() {} })
+function node(type, text = '') { return { type, text, props: {}, children: [], parent: null } }
+function remove(child) {
+  if (child.parent) child.parent.children.splice(child.parent.children.indexOf(child), 1)
+  child.parent = null
+}
+const renderer = createRenderer({
+  createElement: type => node(type), createText: text => node('#text', text), createComment: () => node('#comment'),
+  setText: (node, text) => { node.text = text }, setElementText: (node, text) => { node.children = []; node.text = text },
+  patchProp: (node, key, _, value) => { node.props[key] = value },
+  insert(child, parent, anchor) { remove(child); child.parent = parent; const index = anchor ? parent.children.indexOf(anchor) : -1; parent.children.splice(index < 0 ? parent.children.length : index, 0, child) },
+  remove, parentNode: node => node.parent, nextSibling: node => node.parent?.children[node.parent.children.indexOf(node) + 1],
+})
+function find(root, predicate) {
+  if (predicate(root)) return root
+  for (const child of root.children) { const match = find(child, predicate); if (match) return match }
+}
 const flush = async () => { for (let i = 0; i < 30; i++) await Promise.resolve() }
 async function mount(t, role = 'receiver', type = 'file', options = {}) {
   let session
   const app = renderer.createApp({ setup() { useRoomStore().setRole(role); session = useSession(type, options); return () => null } })
-  app.use(createPinia()); app.mount({})
+  app.use(createPinia()); app.mount(node('root'))
   t.after(() => app.unmount())
   await session.connect('Ab3xY9')
   const ws = Socket.instances.at(-1)
@@ -135,6 +165,7 @@ test('peer failure does not close other devices or signaling', async t => {
   assert.equal(session.peers.get('B').connected, true)
   assert.equal(session.accepted.value, true)
 })
+
 function connectionState(peer, state) { peer.pc.connectionState = state; peer.pc.onconnectionstatechange?.() }
 
 test('temporary RTC disconnect recovers with the same channel and no duplicate connected callback', async t => {
@@ -207,6 +238,79 @@ test('RTC failed is immediate and reset or session cleanup cancels recovery time
   assert.deepEqual(cleaned, ['A', 'B', 'A', 'B'])
 })
 
+async function mountScreen(t, capture) {
+  const descriptor = Object.getOwnPropertyDescriptor(navigator, 'mediaDevices')
+  Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: { getDisplayMedia: capture } })
+  t.after(() => { if (descriptor) Object.defineProperty(navigator, 'mediaDevices', descriptor); else delete navigator.mediaDevices })
+  const root = node('root')
+  const app = renderer.createApp(Screen)
+  app.use(createPinia()); app.mount(root)
+  t.after(() => app.unmount())
+  const session = getScreenSession()
+  await session.connect()
+  const ws = Socket.instances.at(-1)
+  ws.open()
+  ws.receive('accepted', { protocolVersion: 3, code: 'Ab3xY9', role: 'sender', clientId: 'self' })
+  ws.receive('peer-ready', { peerId: 'A', peerRole: 'receiver', initiator: true }, 'A')
+  await flush()
+  ws.receive('answer', { type: 'answer', sdp: 'initial' }, 'A')
+  await flush()
+  const peer = session.peers.get('A')
+  peer.channel.open()
+  peer.pc.getSenders = () => []
+  peer.pc.addTrack = () => {}
+  await nextTick()
+  return { session, ws, peer, start: () => find(root, node => node.type === 'button' && node.text === '开始共享') }
+}
+
+test('screen picker cancellation preserves room, peers and credentials and allows retry', async t => {
+  let captures = 0
+  const track = { stop() {} }
+  const stream = { getTracks: () => [track] }
+  const { session, ws, peer, start } = await mountScreen(t, async () => {
+    if (++captures === 1) throw new DOMException('Permission denied', 'NotAllowedError')
+    return stream
+  })
+  const count = requests
+  await start().props.onClick(); await nextTick()
+  assert.equal(session.roomId.value, 'Ab3xY9')
+  assert.equal(session.accepted.value, true)
+  assert.equal(session.peers.get('A'), peer)
+  assert.equal(peer.channel.readyState, 'open')
+  assert.equal(ws.readyState, Socket.OPEN)
+  assert.match(session.error.value, /重新选择屏幕/)
+  assert.equal(start().props.disabled, false)
+  await start().props.onClick(); await flush(); await nextTick()
+  assert.equal(session.error.value, '')
+  assert.equal(start().props.disabled, true)
+  assert.equal(captures, 2)
+  assert.equal(ws.sent.filter(msg => msg.type === 'offer').length, 2)
+  ws.onclose({ code: 1006 })
+  await session.reconnect()
+  assert.equal(requests, count)
+  assert.equal(Socket.instances.at(-1).url.searchParams.get('senderToken'), token)
+})
+
+test('screen capture errors keep the room and late streams are stopped after disconnect', async t => {
+  let resolveCapture
+  let captures = 0
+  const { session, start } = await mountScreen(t, () => {
+    if (++captures === 1) return Promise.reject(new DOMException('Capture unavailable', 'NotReadableError'))
+    return new Promise(resolve => { resolveCapture = resolve })
+  })
+  await start().props.onClick(); await nextTick()
+  assert.match(session.error.value, /Capture unavailable/)
+  assert.equal(session.accepted.value, true)
+  assert.equal(start().props.disabled, false)
+  const pending = start().props.onClick()
+  session.disconnect()
+  let stopped = 0
+  resolveCapture({ getTracks: () => [{ stop() { stopped++ } }] })
+  await pending; await nextTick()
+  assert.equal(stopped, 1)
+  assert.equal(session.accepted.value, false)
+  assert.equal(session.peers.size, 0)
+})
 test('screen renegotiation requested during initial offer waits for answer', async t => {
   const { session, ws, accept, ready } = await mount(t, 'sender', 'screen')
   accept(); ready('A'); await flush()

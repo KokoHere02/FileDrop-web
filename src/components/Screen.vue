@@ -39,6 +39,7 @@ async function start() {
   if (starting.value || local.value || !session.accepted.value) return
   if (!navigator.mediaDevices?.getDisplayMedia) { session.error.value = '当前浏览器不支持屏幕共享，请使用桌面浏览器并通过 HTTPS 或 localhost 访问'; return }
   starting.value = true
+  session.error.value = ''
   const current = ++captureGeneration
   try {
     const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false })
@@ -50,7 +51,10 @@ async function start() {
       try { attachStream(peer.id); void session.offer(peer.id) } catch (error) { session.failPeer(peer.id, error) }
     }
   } catch (err) {
-    if (current === captureGeneration) { session.disconnect(); session.report(err) }
+    if (current === captureGeneration) {
+      if (err instanceof DOMException && err.name === 'NotAllowedError') session.error.value = '未开始屏幕共享，请重新选择屏幕或允许共享权限'
+      else session.report(err)
+    }
   } finally { if (current === captureGeneration) starting.value = false }
 }
 function togglePause() {
