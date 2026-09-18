@@ -1,6 +1,28 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { createHash, webcrypto } from 'node:crypto'
 import { confirmFile, fileHash, sendFileQueue } from '../src/util/fileTransfer.ts'
+
+test('HTTP without subtle or randomUUID preserves SHA-256 and unique file IDs', async t => {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'crypto')
+  Object.defineProperty(globalThis, 'crypto', { configurable: true, value: { getRandomValues: webcrypto.getRandomValues.bind(webcrypto) } })
+  t.after(() => Object.defineProperty(globalThis, 'crypto', descriptor))
+  const files = [new File([], 'empty'), new File(['hello 世界'], 'text'), new File([new Uint8Array(1024 * 1024 + 65).fill(137)], 'binary')]
+  const { sent, channel, controller } = setup()
+  const confirmed = []
+  await sendFileQueue(files, channel, controller.signal, () => false, () => {}, {
+    confirm: async (id, size, hash) => { confirmed.push({ id, size, hash }) },
+  })
+  const headers = sent.filter(item => typeof item === 'string').map(JSON.parse)
+  assert.equal(new Set(headers.map(header => header.fileId)).size, files.length)
+  for (const [index, file] of files.entries()) {
+    const expected = createHash('sha256').update(new Uint8Array(await file.arrayBuffer())).digest('hex')
+    assert.equal(headers[index].sha256, expected)
+    assert.match(headers[index].fileId, /^[\da-f]{8}-[\da-f]{4}-4[\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/)
+    assert.deepEqual(confirmed[index], { id: headers[index].fileId, size: file.size, hash: expected })
+    assert.equal(await fileHash(new Blob([file])), expected)
+  }
+})
 
 function setup() {
   const sent = []
