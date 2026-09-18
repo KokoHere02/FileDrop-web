@@ -1,5 +1,6 @@
 ﻿import { computed, onBeforeUnmount, ref, shallowReactive } from 'vue'
 import { createRoom } from '../api/room'
+import { copyText } from '../util/clipboard'
 import { useRoomStore } from '../store/RoomStore'
 import type { TransferType } from '../type/type'
 import { isRoomCode, signalingCloseMessage, signalingErrorMessage, type RoomCredentials } from '../util/protocol'
@@ -287,8 +288,8 @@ export function useSession(type: TransferType, options: SessionOptions = {}) {
   }
   function reconnect() { return connect('', true) }
   async function copy(value: string) {
-    try { await navigator.clipboard.writeText(value); notice.value = '已复制到剪贴板' }
-    catch { error.value = '复制失败，请手动选择并复制内容' }
+    try { await copyText(value); error.value = ''; notice.value = '已复制到剪贴板' }
+    catch { notice.value = ''; error.value = '复制失败，请手动选择并复制内容' }
   }
   onBeforeUnmount(disconnect)
   return { role, roomId, clientId, busy, isWs, accepted, connected, connectedPeers, peers, peerList, status, error, notice, canReconnect, connect, reconnect, disconnect, send, offer, failPeer, report, copy }
