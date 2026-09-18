@@ -37,7 +37,12 @@ function attachStream(id: string) {
 }
 async function start() {
   if (starting.value || local.value || !session.accepted.value) return
-  if (!navigator.mediaDevices?.getDisplayMedia) { session.error.value = '当前浏览器不支持屏幕共享，请使用桌面浏览器并通过 HTTPS 或 localhost 访问'; return }
+  if (!navigator.mediaDevices?.getDisplayMedia) {
+    session.error.value = window.isSecureContext === false
+      ? '浏览器禁止在普通 HTTP 页面发起屏幕共享；请在共享端使用 localhost 访问，或由管理员将此站点配置为可信来源后重启浏览器'
+      : '当前浏览器不支持屏幕共享，请使用支持屏幕共享的桌面浏览器'
+    return
+  }
   starting.value = true
   session.error.value = ''
   const current = ++captureGeneration
